@@ -77,6 +77,18 @@ async function shouldReleaseNightly({ github, context, core, now = Date.now() })
     return false;
   }
 
+  // Publishing a nightly updates its Nix pin on main. That alone must not
+  // create another nightly after the gap, which would repeat indefinitely.
+  if (
+    comparison.files?.length &&
+    comparison.files.every(
+      (file) => file.filename === "packaging/nix/releases.json" && !file.previous_filename,
+    )
+  ) {
+    core.info("Only Nix release pins changed. Skipping.");
+    return false;
+  }
+
   core.info(`New commits since ${lastNightly.tag_name}, and the six-hour gap has passed.`);
   return true;
 }
