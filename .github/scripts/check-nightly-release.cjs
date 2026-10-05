@@ -77,8 +77,7 @@ async function shouldReleaseNightly({ github, context, core, now = Date.now() })
     return false;
   }
 
-  // Publishing a nightly updates its Nix pin on main. That alone must not
-  // create another nightly after the gap, which would repeat indefinitely.
+  // Ignore release-pin commits to prevent a nightly release loop.
   if (
     comparison.files?.length &&
     comparison.files.every(

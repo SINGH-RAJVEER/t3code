@@ -1240,7 +1240,6 @@ jobs:
     name: Finalize release
     if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.release.result == 'success' && needs.preflight.outputs.release_channel != 'preview' }}
     needs: [preflight, release]
-    # Stable and nightly publish independently, but both update pins on main.
     concurrency:
       group: release-finalize
       cancel-in-progress: false

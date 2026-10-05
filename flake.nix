@@ -34,7 +34,6 @@
         in
         pkgs.appimageTools.wrapType2 {
           inherit pname version src;
-          # The Nix store is immutable; upgrade through the user's flake input.
           profile = "export T3CODE_DISABLE_AUTO_UPDATE=true";
           extraInstallCommands = ''
             install -Dm644 ${desktopItem}/share/applications/${pname}.desktop \

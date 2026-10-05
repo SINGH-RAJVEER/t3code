@@ -24,7 +24,6 @@ function updateNixRelease(manifest, release) {
   if (!Number.isFinite(Date.parse(publishedAt))) {
     throw new Error(`Release ${tag} has an invalid publication date.`);
   }
-  // Re-running an older release must not move a channel backwards.
   if (Date.parse(manifest[channel].publishedAt) > Date.parse(publishedAt)) {
     return manifest;
   }
