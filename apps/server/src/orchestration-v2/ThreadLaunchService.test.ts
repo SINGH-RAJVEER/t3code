@@ -40,25 +40,26 @@ import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
-import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
-import { makeProviderRegistryLayer } from "../provider/testUtils/providerRegistryMock.ts";
+import * as ProviderRegistryMock from "../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
-import * as IdAllocator from "./IdAllocator.ts";
-import type { ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as ThreadTitleRegeneration from "./ThreadTitleRegenerationService.ts";
-import { makeOrchestratorV2ReplayLayerWithRegistry } from "./testkit/ProviderReplayHarness.ts";
+import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
+import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const projectId = ProjectId.make("project:launch-test");
 const otherProjectId = ProjectId.make("project:launch-other");
@@ -93,7 +94,7 @@ const adapter = {
   getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
   planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
   openSession: () => Effect.die("provider execution is disabled in launch tests"),
-} as ProviderAdapterV2Shape;
+} as ProviderAdapter.ProviderAdapterV2["Service"];
 
 interface HarnessOptions {
   readonly managedFolders?: Layer.Layer<ManagedProjectFolders.ManagedProjectFolders>;
@@ -106,19 +107,20 @@ interface HarnessOptions {
   readonly generateBranchName?: TextGeneration.TextGeneration["Service"]["generateBranchName"];
   readonly serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   readonly providers?: ReadonlyArray<ServerProvider>;
+  readonly git?: Partial<GitWorkflow.GitWorkflowService["Service"]>;
 }
 
 function makeHarness(options: HarnessOptions = {}) {
-  const database = SqlitePersistenceMemory;
-  const registry = ProviderAdapterRegistry.makeLayer([adapter]);
-  const orchestrator = makeOrchestratorV2ReplayLayerWithRegistry(
+  const layerDatabase = SqlitePersistence.layerMemory;
+  const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([adapter]);
+  const layerOrchestrator = ProviderReplayHarness.layerWithRegistry(
     { name: "thread-launch" },
-    registry,
-    { databaseLayer: database, runEffectWorker: false },
+    layerRegistry,
+    { databaseLayer: layerDatabase, runEffectWorker: false },
   );
-  const threadManagement = ThreadManagement.layer.pipe(Layer.provide(orchestrator));
-  const receipts = CommandReceiptStore.layer.pipe(Layer.provide(database));
-  const outbox = EffectOutbox.layer.pipe(Layer.provide(database));
+  const layerThreadManagement = ThreadManagement.layer.pipe(Layer.provide(layerOrchestrator));
+  const layerReceipts = CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
+  const layerOutbox = EffectOutbox.layer.pipe(Layer.provide(layerDatabase));
   const createWorktree = vi.fn(
     options.createWorktree ??
       ((input) =>
@@ -142,7 +144,7 @@ function makeHarness(options: HarnessOptions = {}) {
   const generateThreadTitle = vi.fn(
     options.generateTitle ?? (() => Effect.succeed({ title: "Generated title" })),
   );
-  const externalServices = Layer.mergeAll(
+  const layerExternalServices = Layer.mergeAll(
     WorktreeSetupTracker.layer,
     Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
     Layer.mock(TerminalManager.TerminalManager)({ close: () => Effect.void }),
@@ -174,6 +176,7 @@ function makeHarness(options: HarnessOptions = {}) {
       removeWorktree,
       resolveRemoteTrackingCommit: () =>
         Effect.succeed({ commitSha: "remote-main-sha", remoteRefName: "origin/main" }),
+      ...options.git,
     }),
     Layer.succeed(ProjectSetupScriptRunner.ProjectSetupScriptRunner, {
       runForThread: runSetup,
@@ -183,17 +186,24 @@ function makeHarness(options: HarnessOptions = {}) {
       generateBranchName,
     }),
     ServerSettings.layerTest(options.serverSettings),
-    makeProviderRegistryLayer(options.providers),
+    ProviderRegistryMock.layer(options.providers),
     options.managedFolders ??
       Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
         namedProjectsRoot: "/projects",
         folderForThread: () => Effect.succeed(Option.none()),
       }),
   );
-  const launch = ThreadLaunch.layer.pipe(
-    Layer.provide(Layer.mergeAll(externalServices, threadManagement, receipts, IdAllocator.layer)),
+  const layerLaunch = ThreadLaunch.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        layerExternalServices,
+        layerThreadManagement,
+        layerReceipts,
+        IdAllocator.layer,
+      ),
+    ),
   );
-  const projectedProjects = Layer.mock(ProjectStore.ProjectStoreV2)({
+  const layerProjectedProjects = Layer.mock(ProjectStore.ProjectStoreV2)({
     get: (requestedProjectId) =>
       Effect.succeed(
         requestedProjectId === projectId
@@ -214,17 +224,19 @@ function makeHarness(options: HarnessOptions = {}) {
           : Option.none(),
       ),
   });
-  const titleRegeneration = ThreadTitleRegeneration.layer.pipe(
-    Layer.provide(Layer.mergeAll(threadManagement, projectedProjects, externalServices)),
+  const layerTitleRegeneration = ThreadTitleRegeneration.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(layerThreadManagement, layerProjectedProjects, layerExternalServices),
+    ),
   );
   return {
     layer: Layer.mergeAll(
-      launch,
-      threadManagement,
-      titleRegeneration,
-      outbox,
-      database,
-      externalServices,
+      layerLaunch,
+      layerThreadManagement,
+      layerTitleRegeneration,
+      layerOutbox,
+      layerDatabase,
+      layerExternalServices,
     ),
     createWorktree,
     removeWorktree,
@@ -287,8 +299,15 @@ it.effect.each(
   "attributes $createdBy-configured automations in $target threads without changing their prompt",
   ({ target, createdBy }) => {
     const harness = makeHarness();
-    const scheduledTasks = ScheduledTasks.layer.pipe(
-      Layer.provide(Layer.mergeAll(harness.layer, NodeCrypto.layer, Scheduler.layer)),
+    const layerScheduledTasks = ScheduledTasks.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          harness.layer,
+          NodeCrypto.layer,
+          Scheduler.layer,
+          Layer.mock(SecretRequests.SecretRequests)({}),
+        ),
+      ),
     );
     return Effect.gen(function* () {
       const tasks = yield* ScheduledTasks.ScheduledTaskService;
@@ -337,7 +356,7 @@ it.effect.each(
       );
       assert.equal(turnItem?.text, task.prompt);
       assert.equal(turnItem?.scheduledTaskId, task.id);
-    }).pipe(Effect.provide(Layer.mergeAll(harness.layer, scheduledTasks)));
+    }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerScheduledTasks)));
   },
 );
 
@@ -1947,7 +1966,7 @@ it.effect("creates a strong provider-thread mapping for an imported native sessi
 
 it.effect("shared intake preserves durable attachment bytes after a lost launch result", () => {
   const harness = makeHarness();
-  const files = ServerConfig.layerTest(process.cwd(), { prefix: "t3-message-intake-" }).pipe(
+  const layerFiles = ServerConfig.layerTest(process.cwd(), { prefix: "t3-message-intake-" }).pipe(
     Layer.provideMerge(NodeServices.layer),
   );
   return Effect.gen(function* () {
@@ -2007,6 +2026,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
               }),
             ),
           ),
+        checkWorktreeBase: launches.checkWorktreeBase,
         retryPreparation: launches.retryPreparation,
       }),
       Effect.flip,
@@ -2163,7 +2183,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
       assert.isNotNull(path);
       assert.deepEqual(yield* fs.readFile(path), new Uint8Array([1, 2, 3, 4]));
     }
-  }).pipe(Effect.provide(Layer.mergeAll(harness.layer, files)));
+  }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
 });
 
 it.effect("cancels tracked setup before provider work is released", () =>
@@ -2249,6 +2269,108 @@ it.effect.each([0, 1])("releases an async setup before its completion with exit 
         (yield* threads.getThreadProjection(launched.threadId)).runs[0]?.status,
         "starting",
       );
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect.each([
+  { name: "is missing", baseRef: "t3/renamed", startFromOrigin: false, origin: true },
+  {
+    name: "has no origin to come from",
+    baseRef: "t3/renamed",
+    startFromOrigin: true,
+    origin: false,
+  },
+  {
+    name: "is a previous checkout there never was",
+    baseRef: "-",
+    startFromOrigin: false,
+    origin: true,
+  },
+])("refuses a new worktree whose base ref $name", (testCase) =>
+  Effect.gen(function* () {
+    const harness = makeHarness({
+      hasCommit: ({ refName }) => Effect.succeed(refName === "HEAD"),
+      git: {
+        remoteExists: () => Effect.succeed(testCase.origin),
+        hasRefNamed: () => Effect.succeed(false),
+      },
+    });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const error = yield* launches
+        .checkWorktreeBase({
+          projectId,
+          workspaceStrategy: {
+            type: "worktree",
+            baseRef: testCase.baseRef,
+            startFromOrigin: testCase.startFromOrigin,
+          },
+        })
+        .pipe(Effect.flip);
+      assert.deepInclude(error, {
+        _tag: "ThreadLaunchBaseRefError",
+        projectId,
+        baseRef: testCase.baseRef,
+      });
+      assert.equal(
+        error.message,
+        `Base ref "${testCase.baseRef}" does not resolve to a commit in project "Project" (/repo).`,
+      );
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect.each([
+  { name: "a base ref that resolves", baseRef: "main", commits: ["main", "HEAD"] },
+  // Provisioning fetches it; the ref may exist nowhere else yet.
+  {
+    name: "a base ref only origin has",
+    baseRef: "remote-only",
+    startFromOrigin: true,
+    commits: ["HEAD"],
+  },
+  // `git worktree add` starts from a remote-tracking branch of that name.
+  {
+    name: "a base ref a remote branch carries",
+    baseRef: "remote-only",
+    commits: ["HEAD"],
+    remoteBranch: true,
+  },
+  // Provisioning runs such a repository without a worktree.
+  { name: "a repository with no commits yet", baseRef: "main", commits: [] },
+  { name: "the previous checkout", baseRef: "-", commits: ["@{-1}", "HEAD"] },
+  { name: "a commit search", baseRef: ":/fix", commits: ["HEAD"] },
+  { name: "a folder that is not a repository", baseRef: "main", commits: null },
+])("leaves $name to the launch", (testCase) =>
+  Effect.gen(function* () {
+    const { commits } = testCase;
+    const harness = makeHarness({
+      git: { hasRefNamed: () => Effect.succeed(testCase.remoteBranch === true) },
+      hasCommit: ({ refName }) =>
+        commits === null
+          ? Effect.fail(
+              new GitCommandError({
+                operation: "GitWorkflowService.hasCommit",
+                command: "git rev-parse",
+                cwd: "/repo",
+                detail: "Not a Git repository.",
+              }),
+            )
+          : Effect.succeed(commits.includes(refName)),
+    });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      yield* launches.checkWorktreeBase({
+        projectId,
+        workspaceStrategy: {
+          type: "worktree",
+          baseRef: testCase.baseRef,
+          ...(testCase.startFromOrigin === undefined
+            ? {}
+            : { startFromOrigin: testCase.startFromOrigin }),
+        },
+      });
     }).pipe(Effect.provide(harness.layer));
   }),
 );

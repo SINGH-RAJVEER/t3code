@@ -1,4 +1,6 @@
+import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -32,6 +34,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -42,14 +45,14 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as ServerConfig from "../config.ts";
-import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
-import * as OrchestrationEventStore from "../persistence/Services/OrchestrationEventStore.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
-import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
-import type { ProviderInstance } from "../provider/ProviderDriver.ts";
+import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
+import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -63,30 +66,25 @@ import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryServic
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as PullRequestWatchReactor from "./PullRequestWatchReactor.ts";
-import { PullRequestProviderError } from "../pullRequest/PullRequestProvider.ts";
+import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ProjectStore from "./ProjectStore.ts";
-import type { ProviderAdapterV2SessionRuntime, ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
-import {
-  OrchestrationEventInfrastructureLayerLive,
-  OrchestrationV2EventSinkLayerLive,
-  OrchestrationV2LayerLive,
-  ProjectServiceLayerLive,
-} from "./runtimeLayer.ts";
+import * as RuntimeLayer from "./runtimeLayer.ts";
 import { shellStreamItemFromThreadShell } from "./ShellStream.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
-const PlatformTestLayer = Layer.merge(
+const layerPlatformTest = Layer.merge(
   NodeServices.layer,
   Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
     resolveLink: () => Effect.die("unused title link"),
   }),
 );
 
-const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
+const layerServerConfig = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-orchestration-v2-runtime-layer-",
 });
 
@@ -96,20 +94,20 @@ const modelSelection = {
 } satisfies ModelSelection;
 const alternateInstanceId = ProviderInstanceId.make("codex_alternate");
 
-const VcsDriverRegistryTestLayer = VcsDriverRegistry.layer.pipe(
+const layerVcsDriverRegistryTest = VcsDriverRegistry.layer.pipe(
   Layer.provide(VcsProcess.layer),
-  Layer.provide(ServerConfigLayer),
-  Layer.provide(PlatformTestLayer),
+  Layer.provide(layerServerConfig),
+  Layer.provide(layerPlatformTest),
 );
 
-const CheckpointStoreTestLayer = CheckpointStore.layer.pipe(
-  Layer.provide(VcsDriverRegistryTestLayer),
+const layerCheckpointStoreTest = CheckpointStore.layer.pipe(
+  Layer.provide(layerVcsDriverRegistryTest),
 );
-const GitWorkflowTestLayer = Layer.mock(GitWorkflow.GitWorkflowService)({
+const layerGitWorkflowTest = Layer.mock(GitWorkflow.GitWorkflowService)({
   pruneWorktrees: () => Effect.void,
   createWorktree: () => Effect.succeed({} as never),
 });
-const ProjectServiceTestLayer = Layer.mock(ProjectService.ProjectService)({
+const layerProjectServiceTest = Layer.mock(ProjectService.ProjectService)({
   getById: () => Effect.succeed(Option.none()),
 });
 
@@ -120,7 +118,7 @@ const orchestrationAdapter = {
   getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
   planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
   openSession: () => Effect.die("sessions are not used by lifecycle tests"),
-} as ProviderAdapterV2Shape;
+} as ProviderAdapter.ProviderAdapterV2["Service"];
 const providerInstance = {
   instanceId: modelSelection.instanceId,
   driverKind: driver,
@@ -149,7 +147,7 @@ const alternateProviderInstance = {
   },
 } satisfies ProviderInstance;
 
-const TestProviderInstanceRegistry = Layer.succeed(
+const layerTestProviderInstanceRegistry = Layer.succeed(
   ProviderInstanceRegistry.ProviderInstanceRegistry,
   {
     getInstance: (instanceId) =>
@@ -172,7 +170,7 @@ const watchedPullRequestDetail = (input: {
   readonly number: number;
   readonly at: string;
 }): PullRequestDetail => ({
-  provider: "github",
+  provider: SourceControlProviderKind.make("github"),
   capabilities: {
     diff: true,
     comment: true,
@@ -267,41 +265,43 @@ const moveProject = (projectId: ProjectId, workspaceRoot: string, updatedAt: str
     }),
   );
 
-const TestLayer = Layer.mergeAll(
-  OrchestrationV2LayerLive,
-  OrchestrationV2EventSinkLayerLive,
+const layerTest = Layer.mergeAll(
+  RuntimeLayer.layer,
+  RuntimeLayer.layerEventSink,
   ProjectStore.layer,
   ProjectionStore.layer,
   EffectOutbox.layer,
   ThreadCommandExecutor.layer,
 ).pipe(
   Layer.provide(McpSessionRegistryTestkit.layer),
-  Layer.provide(SqlitePersistenceMemory),
-  Layer.provide(CheckpointStoreTestLayer),
-  Layer.provide(ServerConfigLayer),
+  Layer.provide(McpProviderSessions.layer),
+  Layer.provide(SqlitePersistence.layerMemory),
+  Layer.provide(layerCheckpointStoreTest),
+  Layer.provide(layerServerConfig),
   Layer.provide(ServerSettings.layerTest()),
-  Layer.provide(TestProviderInstanceRegistry),
-  Layer.provide(GitWorkflowTestLayer),
-  Layer.provide(ProjectServiceTestLayer),
-  Layer.provide(PlatformTestLayer),
+  Layer.provide(layerTestProviderInstanceRegistry),
+  Layer.provide(layerGitWorkflowTest),
+  Layer.provide(layerProjectServiceTest),
+  Layer.provide(layerPlatformTest),
 );
 
-const LegacyImportTestLayer = OrchestrationV2LayerLive.pipe(
+const layerLegacyImportTest = RuntimeLayer.layer.pipe(
   Layer.provide(McpSessionRegistryTestkit.layer),
-  Layer.provideMerge(SqlitePersistenceMemory),
-  Layer.provide(CheckpointStoreTestLayer),
-  Layer.provide(ServerConfigLayer),
+  Layer.provide(McpProviderSessions.layer),
+  Layer.provideMerge(SqlitePersistence.layerMemory),
+  Layer.provide(layerCheckpointStoreTest),
+  Layer.provide(layerServerConfig),
   Layer.provide(ServerSettings.layerTest()),
-  Layer.provide(TestProviderInstanceRegistry),
-  Layer.provide(GitWorkflowTestLayer),
-  Layer.provide(ProjectServiceTestLayer),
-  Layer.provide(PlatformTestLayer),
+  Layer.provide(layerTestProviderInstanceRegistry),
+  Layer.provide(layerGitWorkflowTest),
+  Layer.provide(layerProjectServiceTest),
+  Layer.provide(layerPlatformTest),
 );
 
-const ProjectDeletionTestLayer = Layer.mergeAll(
-  OrchestrationV2LayerLive.pipe(Layer.provide(ProjectServiceLayerLive)),
-  ProjectServiceLayerLive,
-  OrchestrationV2EventSinkLayerLive,
+const layerProjectDeletionTest = Layer.mergeAll(
+  RuntimeLayer.layer.pipe(Layer.provide(RuntimeLayer.layerProjectService)),
+  RuntimeLayer.layerProjectService,
+  RuntimeLayer.layerEventSink,
   ThreadCommandExecutor.layer,
 ).pipe(
   Layer.provide(
@@ -327,16 +327,17 @@ const ProjectDeletionTestLayer = Layer.mergeAll(
     }),
   ),
   Layer.provide(McpSessionRegistryTestkit.layer),
-  Layer.provide(SqlitePersistenceMemory),
-  Layer.provide(CheckpointStoreTestLayer),
-  Layer.provide(ServerConfigLayer),
+  Layer.provide(McpProviderSessions.layer),
+  Layer.provide(SqlitePersistence.layerMemory),
+  Layer.provide(layerCheckpointStoreTest),
+  Layer.provide(layerServerConfig),
   Layer.provide(ServerSettings.layerTest()),
-  Layer.provide(TestProviderInstanceRegistry),
-  Layer.provide(GitWorkflowTestLayer),
-  Layer.provide(PlatformTestLayer),
+  Layer.provide(layerTestProviderInstanceRegistry),
+  Layer.provide(layerGitWorkflowTest),
+  Layer.provide(layerPlatformTest),
 );
 
-it.layer(ProjectDeletionTestLayer)("project deletion during thread commands", (it) => {
+it.layer(layerProjectDeletionTest)("project deletion during thread commands", (it) => {
   it.effect("waits for an in-flight thread update before planning deletion", () =>
     Effect.gen(function* () {
       const projects = yield* ProjectService.ProjectService;
@@ -440,11 +441,11 @@ it.layer(ProjectDeletionTestLayer)("project deletion during thread commands", (i
   );
 });
 
-const SharedApplicationDataPlaneTestLayer = Layer.mergeAll(
-  OrchestrationV2LayerLive.pipe(Layer.provide(ProjectServiceLayerLive)),
-  ProjectServiceLayerLive,
-  OrchestrationV2EventSinkLayerLive,
-  OrchestrationEventInfrastructureLayerLive,
+const layerSharedApplicationDataPlaneTest = Layer.mergeAll(
+  RuntimeLayer.layer.pipe(Layer.provide(RuntimeLayer.layerProjectService)),
+  RuntimeLayer.layerProjectService,
+  RuntimeLayer.layerEventSink,
+  RuntimeLayer.layerEventInfrastructure,
 ).pipe(
   Layer.provide(
     Layer.mock(WorkspacePaths.WorkspacePaths)({
@@ -471,16 +472,17 @@ const SharedApplicationDataPlaneTestLayer = Layer.mergeAll(
     }),
   ),
   Layer.provide(McpSessionRegistryTestkit.layer),
-  Layer.provideMerge(SqlitePersistenceMemory),
-  Layer.provide(CheckpointStoreTestLayer),
-  Layer.provide(ServerConfigLayer),
+  Layer.provide(McpProviderSessions.layer),
+  Layer.provideMerge(SqlitePersistence.layerMemory),
+  Layer.provide(layerCheckpointStoreTest),
+  Layer.provide(layerServerConfig),
   Layer.provide(ServerSettings.layerTest()),
-  Layer.provide(TestProviderInstanceRegistry),
-  Layer.provide(GitWorkflowTestLayer),
-  Layer.provide(PlatformTestLayer),
+  Layer.provide(layerTestProviderInstanceRegistry),
+  Layer.provide(layerGitWorkflowTest),
+  Layer.provide(layerPlatformTest),
 );
 
-it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
+it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
   it.effect("emits model updates separately from provider switches", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -836,7 +838,7 @@ it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
           assert.deepEqual(yield* outbox.listByCommandId(commandId), []);
         }
       }
-    }).pipe(Effect.provide(Layer.fresh(TestLayer))),
+    }).pipe(Effect.provide(Layer.fresh(layerTest))),
   );
 
   it.effect("resolves delivery intent against the active run and starts after it completes", () =>
@@ -929,7 +931,9 @@ it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
       const sessionSpy = vi
         .spyOn(sessions, "get")
         .mockReturnValue(
-          Effect.succeed(Option.some({ providerSession } as ProviderAdapterV2SessionRuntime)),
+          Effect.succeed(
+            Option.some({ providerSession } as ProviderAdapter.ProviderAdapterV2SessionRuntime),
+          ),
         );
       yield* Effect.addFinalizer(() => Effect.sync(() => sessionSpy.mockRestore()));
 
@@ -1477,7 +1481,7 @@ it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
   );
 });
 
-it.layer(LegacyImportTestLayer)("OrchestrationV2 legacy import", (it) => {
+it.layer(layerLegacyImportTest)("OrchestrationV2 legacy import", (it) => {
   it.effect("hydrates imported transcripts before commands and propagates hydration failures", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -1677,7 +1681,7 @@ it.layer(LegacyImportTestLayer)("OrchestrationV2 legacy import", (it) => {
   );
 });
 
-it.layer(TestLayer)("OrchestrationV2LayerLive lifecycle", (it) => {
+it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
   it.effect("applies lifecycle commands idempotently and emits archive/removal shell deltas", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -2569,7 +2573,7 @@ it.layer(TestLayer)("OrchestrationV2LayerLive lifecycle", (it) => {
           operation: "getChangeRequest",
           detail: "github requests are paused until the rate limit resets",
           cause: new PullRequestProviderError({
-            provider: "github",
+            provider: SourceControlProviderKind.make("github"),
             operation: "getChangeRequest",
             reason: "rate-limited",
             detail: "paused",
@@ -2667,6 +2671,276 @@ it.layer(TestLayer)("OrchestrationV2LayerLive lifecycle", (it) => {
           ]);
         }
       }),
+  );
+
+  it.effect("reports how long an ended watch was quiet", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const threadId = ThreadId.make("runtime-pull-request-watch-ended");
+      const projectId = ProjectId.make("pr-watch-ended-project");
+      yield* seedProject({
+        projectId,
+        title: "Watch ended",
+        workspaceRoot: "/workspace/watch-ended",
+        defaultModelSelection: null,
+        createdAt: "2026-10-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("pr-watch-ended-create"),
+        threadId,
+        projectId,
+        title: "Watch ended",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      const key = { host: "github.com", repository: "pingdotgg/t3code", number: 11 };
+      const watching = (on: boolean, id: string) =>
+        orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`pr-watch-ended-${id}`),
+          threadId,
+          ...key,
+          watching: on,
+          link: { url: "https://github.com/pingdotgg/t3code/pull/11", source: "agent" },
+        });
+      yield* watching(true, "start");
+
+      let headSha = "aaaaaaa";
+      const ended: Array<unknown> = [];
+      const capture = Logger.make(({ message }) => {
+        const [text, fields] = Array.isArray(message) ? message : [message];
+        if (text === "pull request watch ended") ended.push(fields);
+      });
+      const reactor = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.mock(PullRequestService.PullRequestService)({
+              detail: () =>
+                Effect.sync(() => ({
+                  ...watchedPullRequestDetail({ projectId, number: key.number, at: "2026-10-02" }),
+                  headSha,
+                  checks: [],
+                })),
+              activity: () =>
+                Effect.succeed({
+                  comments: [],
+                  commentCount: 0,
+                  commentsTruncated: false,
+                  reviewThreads: [],
+                  commits: [],
+                }),
+            }),
+          ),
+        ),
+      );
+      const sweep = reactor.sweep.pipe(Effect.provide(Logger.layer([capture])));
+
+      // The first read learns the head. A push 6 hours later, then 2 quiet hours.
+      yield* sweep;
+      yield* TestClock.adjust("6 hours");
+      headSha = "bbbbbbb";
+      yield* sweep;
+      yield* TestClock.adjust("2 hours");
+      yield* sweep;
+      yield* watching(false, "stop");
+      // The end is reported once.
+      yield* sweep;
+      yield* sweep;
+
+      assert.deepEqual(ended, [
+        {
+          threadId,
+          pullRequest: "github.com/pingdotgg/t3code#11",
+          reason: "stopped",
+          minutes: 480,
+          quietMinutes: 120,
+          longestQuietMinutes: 360,
+          wakes: 0,
+          reads: 3,
+          partial: false,
+        },
+      ]);
+    }),
+  );
+
+  it.effect("with a host fingerprint, a watch reads only what moved", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projectId = ProjectId.make("pr-watch-fingerprint-project");
+      const threadId = ThreadId.make("runtime-pull-request-watch-fingerprint");
+      yield* seedProject({
+        projectId,
+        title: "Watch fingerprint",
+        workspaceRoot: "/workspace/watch-fingerprint",
+        defaultModelSelection: null,
+        createdAt: "2026-10-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("pr-watch-fingerprint-create"),
+        threadId,
+        projectId,
+        title: "Watch fingerprint",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("pr-watch-fingerprint-start"),
+        threadId,
+        host: "github.com",
+        repository: "pingdotgg/t3code",
+        number: 11,
+        watching: true,
+        link: { url: "https://github.com/pingdotgg/t3code/pull/11", source: "agent" },
+      });
+
+      let fingerprint: { status: string; remarks: string } | "rate-limited" = {
+        status: "OPEN pending",
+        remarks: "0",
+      };
+      type CheckStatus = "pending" | "success" | "failure";
+      // What the host says now, and what a read answers: a read right after a cache fill can
+      // still answer from before a change until the cache is invalidated.
+      let checks: { lint: CheckStatus; test: CheckStatus } = { lint: "pending", test: "pending" };
+      let cachedChecks: typeof checks | null = null;
+      let comments: Array<PullRequestComment> = [];
+      let detailReads = 0;
+      let activityReads = 0;
+      const reactor = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.mock(PullRequestService.PullRequestService)({
+              watchFingerprint: () =>
+                Effect.suspend(() =>
+                  fingerprint === "rate-limited"
+                    ? Effect.fail(
+                        new PullRequestOperationError({
+                          operation: "watchFingerprint",
+                          detail: "paused",
+                          cause: new PullRequestProviderError({
+                            provider: SourceControlProviderKind.make("github"),
+                            operation: "getChangeRequestWatchFingerprint",
+                            reason: "rate-limited",
+                            detail: "paused",
+                          }),
+                        }),
+                      )
+                    : Effect.succeed(fingerprint),
+                ),
+              invalidate: () =>
+                Effect.sync(() => {
+                  cachedChecks = null;
+                }),
+              detail: () =>
+                Effect.sync(() => {
+                  detailReads += 1;
+                  const answer = cachedChecks ?? checks;
+                  cachedChecks = null;
+                  return {
+                    ...watchedPullRequestDetail({
+                      projectId,
+                      number: 11,
+                      at: "2026-10-02T12:00:00.000Z",
+                    }),
+                    checks: Object.entries(answer).map(([name, status]) => ({
+                      name,
+                      status,
+                      description: null,
+                      url: null,
+                    })),
+                  };
+                }),
+              activity: () =>
+                Effect.sync(() => {
+                  activityReads += 1;
+                  return {
+                    comments,
+                    commentCount: comments.length,
+                    commentsTruncated: false,
+                    reviewThreads: [],
+                    commits: [],
+                  };
+                }),
+            }),
+          ),
+        ),
+      );
+      const reads = () => ({ detail: detailReads, activity: activityReads });
+      const summaries = Effect.map(
+        orchestrator.getThreadRecords(threadId, ["messages"]),
+        ({ messages }) => messages.flatMap((message) => message.notification?.summary ?? []),
+      );
+
+      // The first look reads everything.
+      yield* reactor.sweep;
+      assert.deepEqual(reads(), { detail: 1, activity: 1 });
+
+      // While checks run, the cheap detail is read every pass: check counts by state cannot
+      // tell which check finished, so a failure can arrive with the fingerprint unchanged.
+      checks = { lint: "failure", test: "pending" };
+      yield* reactor.sweep;
+      assert.deepEqual(reads(), { detail: 2, activity: 1 });
+      assert.deepEqual(yield* summaries, ["#11: checks failed"]);
+
+      // When the fingerprint moves, a cached answer from before the move is not trusted.
+      yield* TestClock.adjust("1 millis");
+      cachedChecks = checks;
+      checks = { lint: "failure", test: "success" };
+      fingerprint = { status: "OPEN settled", remarks: "0" };
+      yield* reactor.sweep;
+      assert.deepEqual(reads(), { detail: 3, activity: 1 });
+
+      // Nothing in flight and nothing moved, so the passes read nothing.
+      for (let pass = 0; pass < 5; pass += 1) yield* reactor.sweep;
+      assert.deepEqual(reads(), { detail: 3, activity: 1 });
+
+      // A new comment moves the remarks, which take the activity read too.
+      yield* TestClock.adjust("1 millis");
+      comments = [
+        {
+          id: "comment-1",
+          kind: "issue-comment",
+          author: { login: "reviewer", name: null, avatarUrl: null },
+          body: "Please rename this.",
+          createdAt: "2999-01-01T00:00:00.000Z",
+          url: null,
+          path: null,
+          reviewState: null,
+        },
+      ];
+      fingerprint = { status: "OPEN settled", remarks: "1" };
+      yield* reactor.sweep;
+      assert.deepEqual(reads(), { detail: 4, activity: 2 });
+      assert.deepEqual(yield* summaries, ["#11: checks failed", "#11: new comments"]);
+
+      // While the host is rate limited, a pass reads nothing and the watch stays on.
+      fingerprint = "rate-limited";
+      yield* reactor.sweep;
+      assert.deepEqual(reads(), { detail: 4, activity: 2 });
+      assert.isDefined((yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch);
+
+      // Edits inside review threads leave no trace in the fingerprint, so the activity is read
+      // again after half an hour regardless.
+      fingerprint = { status: "OPEN settled", remarks: "1" };
+      yield* TestClock.adjust("30 minutes");
+      yield* reactor.sweep;
+      assert.deepEqual(reads(), { detail: 5, activity: 3 });
+      assert.deepEqual(yield* summaries, ["#11: checks failed", "#11: new comments"]);
+    }),
   );
 
   it.effect.each([
@@ -2938,6 +3212,12 @@ it.layer(TestLayer)("OrchestrationV2LayerLive lifecycle", (it) => {
           threadId,
           messageId: MessageId.make("restart-automatic-message"),
           text: "Continue where you left off.",
+          notification: {
+            source: { kind: "system" as const },
+            outcome: "updated" as const,
+            summary: "T3 Code restarted and resumed this turn",
+            detail: "Continue where you left off.",
+          },
           attachments: [],
           modelSelection,
           dispatchMode: { type: "start_immediately" as const },
@@ -2948,6 +3228,17 @@ it.layer(TestLayer)("OrchestrationV2LayerLive lifecycle", (it) => {
         const admitted = yield* orchestrator.getThreadProjection(threadId);
         assert.lengthOf(admitted.runs, 2);
         assert.equal(admitted.runs[1]?.restartContinuationOfRunId, original.id);
+        // The timeline shows a work log row; the prompt stays in its detail.
+        const continuationItems = admitted.turnItems.filter(
+          (item) => item.runId === admitted.runs[1]?.id,
+        );
+        assert.isFalse(continuationItems.some((item) => item.type === "user_message"));
+        assert.deepInclude(
+          continuationItems.flatMap((item) =>
+            item.type === "notification" ? [[item.summary, item.detail]] : [],
+          ),
+          ["T3 Code restarted and resumed this turn", "Continue where you left off."],
+        );
         // A differently identified stale delivery still must not create another run.
         yield* orchestrator.dispatch({
           ...command,
@@ -3099,11 +3390,80 @@ it.layer(TestLayer)("OrchestrationV2LayerLive lifecycle", (it) => {
         .pipe(Effect.flip);
 
       assert.equal(error._tag, "OrchestratorDispatchError");
+      assert.equal(error.cause, `Thread ${threadId} is still running. Stop it before settling.`);
       const projection = yield* orchestrator.getThreadProjection(threadId);
       assert.equal(projection.runs[0]?.status, "starting");
       assert.isNull(projection.thread.settledOverride);
       assert.isNull(projection.thread.settledAt);
       assert.isNotNull(projection.thread.unsettledAt);
+    }),
+  );
+
+  it.effect("settles a thread its own agent settled once the turn completes", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+      const projectId = ProjectId.make("runtime-layer-settle-after-run-project");
+      const threadId = ThreadId.make("runtime-layer-settle-after-run-thread");
+
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-settle-after-run-create"),
+        threadId,
+        projectId,
+        title: "Settle after run",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: "/tmp/runtime-layer-settle-after-run",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-settle-after-run-message"),
+        threadId,
+        messageId: MessageId.make("runtime-layer-settle-after-run-message"),
+        text: "Fix it and then settle this thread.",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0];
+      if (run === undefined) return yield* Effect.die(new Error("Run missing."));
+
+      const settled = yield* orchestrator
+        .streamStoredEventsFrom({ threadId, afterSequence: 0, eventType: "thread.settled" })
+        .pipe(Stream.runHead, Effect.forkChild);
+      const result = yield* threadManagement.settleThread({
+        threadId,
+        commandId: CommandId.make("runtime-layer-settle-after-run-settle"),
+        byOwnAgent: true,
+      });
+      assert.deepEqual(result, { settlesWhenTurnEnds: true });
+      assert.isNull((yield* orchestrator.getThreadProjection(threadId)).thread.settledOverride);
+      const now = yield* DateTime.now;
+      yield* eventSink.write({
+        commandId: CommandId.make("runtime-layer-settle-after-run-completed"),
+        events: [
+          {
+            id: EventId.make("runtime-layer-settle-after-run-completed"),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: { ...run, status: "completed", startedAt: now, completedAt: now },
+          },
+        ],
+      });
+      yield* Fiber.join(settled);
+
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(projection.thread.settledOverride, "settled");
     }),
   );
 
@@ -3229,6 +3589,10 @@ it.layer(TestLayer)("OrchestrationV2LayerLive lifecycle", (it) => {
         })
         .pipe(Effect.flip);
       assert.equal(error._tag, "OrchestratorDispatchError");
+      assert.equal(
+        error.cause,
+        `Thread ${threadId} has a queued message. Send it or remove it from the queue before settling.`,
+      );
     }),
   );
 
@@ -4078,7 +4442,7 @@ it.layer(TestLayer)("OrchestrationV2LayerLive lifecycle", (it) => {
   );
 });
 
-it.layer(SharedApplicationDataPlaneTestLayer)("pending provider interruption", (it) => {
+it.layer(layerSharedApplicationDataPlaneTest)("pending provider interruption", (it) => {
   it.effect("interrupts a pending provider start without launching provider work", () =>
     Effect.gen(function* () {
       const projects = yield* ProjectService.ProjectService;
@@ -4152,7 +4516,7 @@ it.layer(SharedApplicationDataPlaneTestLayer)("pending provider interruption", (
   );
 });
 
-it.layer(SharedApplicationDataPlaneTestLayer)("snooze projection", (it) => {
+it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
   it.effect("carries snooze state through the V2 shell projection", () =>
     Effect.gen(function* () {
       const projects = yield* ProjectService.ProjectService;
@@ -4208,6 +4572,24 @@ it.layer(SharedApplicationDataPlaneTestLayer)("snooze projection", (it) => {
       assert.deepEqual(thread.updatedAt, firstUpdatedAt);
 
       yield* orchestrator.dispatch({
+        type: "thread.unsnooze",
+        commandId: CommandId.make("runtime-layer-snoozed-thread-wake"),
+        threadId,
+        reason: "user",
+      });
+      const projections = yield* ProjectionStore.ProjectionStoreV2.pipe(
+        Effect.provide(ProjectionStore.layer),
+      );
+      const [candidate] = yield* projections.getSettlementCandidates(threadId);
+      assert.deepEqual(candidate?.lastSnoozeWakeAt, yield* DateTime.now);
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make("runtime-layer-snoozed-thread-snooze-after-wake"),
+        threadId,
+        snoozedUntil,
+      });
+
+      yield* orchestrator.dispatch({
         type: "message.dispatch",
         createdBy: "user",
         creationSource: "web",
@@ -4227,7 +4609,7 @@ it.layer(SharedApplicationDataPlaneTestLayer)("snooze projection", (it) => {
   );
 });
 
-it.layer(SharedApplicationDataPlaneTestLayer)("visited projection", (it) => {
+it.layer(layerSharedApplicationDataPlaneTest)("visited projection", (it) => {
   it.effect("carries the visited watermark through the V2 shell projection", () =>
     Effect.gen(function* () {
       const projects = yield* ProjectService.ProjectService;
@@ -4335,7 +4717,7 @@ it.layer(SharedApplicationDataPlaneTestLayer)("visited projection", (it) => {
   );
 });
 
-it.layer(SharedApplicationDataPlaneTestLayer)("shared application data plane", (it) => {
+it.layer(layerSharedApplicationDataPlaneTest)("shared application data plane", (it) => {
   it.effect("orders retained project transactions and V2 thread transactions in one source", () =>
     Effect.gen(function* () {
       const projects = yield* ProjectService.ProjectService;
@@ -4410,7 +4792,7 @@ it.layer(SharedApplicationDataPlaneTestLayer)("shared application data plane", (
   );
 });
 
-it.layer(TestLayer)("usage-limit recovery", (it) => {
+it.layer(layerTest)("usage-limit recovery", (it) => {
   it.effect.each(["interrupted", "usage_limit"] as const)(
     "manually resumes an %s run ahead of its queued message only once",
     (reason) =>
